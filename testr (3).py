@@ -1,4 +1,6 @@
+import argparse
 import os
+import shutil
 import time
 from typing import Dict, Optional
 
@@ -37,6 +39,14 @@ BATCH_SIZE = 4
 GRAD_ACCUM = 4
 LR = 2e-4
 
+# Диапазон значений r для поиска оптимального
+R_VALUES = [4, 8, 16, 32, 64]
+
+# Уменьшенные подвыборки для быстрого теста (значение <=0 отключает усечённую выборку)
+TRAIN_SUBSET_SIZE = 500
+EVAL_SUBSET_SIZE = 100
+RAW_EVAL_SUBSET_SIZE = 100
+
 # Системный промпт (одинаковый для обучения и генерации)
 SYSTEM_PROMPT = (
     "Ты — профессиональный редактор, создающий краткие аннотации для объявлений.\n"
@@ -65,10 +75,14 @@ run["hparams"] = {
 # Aim Callback
 # ======================
 class AimLoggingCallback(TrainerCallback):
-    """Пишет числовые логи Trainer в Aim, использует epoch как шаг."""
+    """Пишет числовые логи Trainer в Aim, использует epoch как шаг и фиксирует r."""
 
-    def __init__(self):
+    def __init__(self, r_value: int):
+        self.r_value = r_value
         self.epoch_start_time: Optional[float] = None
+
+    def _context(self, subset: str):
+        return {"r": self.r_value, "subset": subset}
 
     def on_epoch_begin(self, args, state, control, **kwargs):
         self.epoch_start_time = time.time()
@@ -83,13 +97,21 @@ class AimLoggingCallback(TrainerCallback):
         step = int(step or 0)
 
         for key, value in logs.items():
-            if isinstance(value, (int, float)):
-                run.track(value, name=key, step=step)
+            if not isinstance(value, (int, float)):
+                continue
+
+            subset = "eval" if key.startswith("eval_") else "train"
+            run.track(value, name=key, step=step, context=self._context(subset))
 
     def on_epoch_end(self, args, state, control, **kwargs):
         step = int(state.epoch or state.global_step or 0)
         epoch_time = time.time() - self.epoch_start_time if self.epoch_start_time else 0.0
-        run.track(epoch_time, name="epoch_time_seconds", step=step)
+        run.track(
+            epoch_time,
+            name="epoch_time_seconds",
+            step=step,
+            context=self._context("epoch"),
+        )
 
 
 # ======================
@@ -244,7 +266,7 @@ def tokenize_dataset(examples, tokenizer):
 # ======================
 # QLoRA модель
 # ======================
-def load_qlora_model_fp16(model_name: str):
+def load_qlora_model_fp16(model_name: str, r_value: int):
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
@@ -262,7 +284,7 @@ def load_qlora_model_fp16(model_name: str):
     model = prepare_model_for_kbit_training(model)
 
     lora_config = LoraConfig(
-        r=16,
+        r=r_value,
         lora_alpha=32,
         lora_dropout=0.05,
         bias="none",
@@ -298,11 +320,51 @@ class CustomTrainer(Trainer):
 # ======================
 # main
 # ======================
-def main():
+def maybe_subsample(dataset, subset_size: Optional[int]):
+    if subset_size is None or subset_size <= 0 or subset_size >= len(dataset):
+        return dataset
+    return dataset.shuffle(seed=SEED).select(range(subset_size))
+
+
+def describe_subset(name: str, subset_size: Optional[int], total_size: int) -> str:
+    if subset_size is None or subset_size <= 0 or subset_size >= total_size:
+        return f"{name}: полная выборка ({total_size} примеров)"
+
+    pct = 100.0 * subset_size / max(1, total_size)
+    return f"{name}: {subset_size} из {total_size} (~{pct:.2f}% выборки)"
+
+
+def main(cli_args):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    all_results = []
 
     tokenizer = make_tokenizer(MODEL_NAME)
     raw_datasets = load_and_filter_data(CSV_PATH)
+
+    train_subset_size = cli_args.train_subset
+    eval_subset_size = cli_args.eval_subset
+    raw_eval_subset_size = cli_args.raw_eval_subset
+
+    run["hparams"].update(
+        {
+            "train_subset_size": train_subset_size,
+            "eval_subset_size": eval_subset_size,
+            "raw_eval_subset_size": raw_eval_subset_size,
+        }
+    )
+
+    print("Размеры подвыборок (<=0 — используем весь доступный датасет):")
+    print(
+        " - "
+        + describe_subset("train", train_subset_size, len(raw_datasets["train"]))
+    )
+    print(
+        " - " + describe_subset("eval", eval_subset_size, len(raw_datasets["test"]))
+    )
+    print(
+        " - "
+        + describe_subset("raw_eval", raw_eval_subset_size, len(raw_datasets["test"]))
+    )
 
     tokenize_fn = lambda examples: tokenize_dataset(examples, tokenizer)
     tokenized_train = raw_datasets["train"].map(
@@ -317,76 +379,172 @@ def main():
         remove_columns=raw_datasets["test"].column_names,
         desc="Токенизация test",
     )
-    tokenized_datasets = DatasetDict(train=tokenized_train, test=tokenized_test)
 
-    model = load_qlora_model_fp16(MODEL_NAME)
+    tokenized_train = maybe_subsample(tokenized_train, train_subset_size)
+    tokenized_test = maybe_subsample(tokenized_test, eval_subset_size)
+    raw_eval_subset = maybe_subsample(raw_datasets["test"], raw_eval_subset_size)
+    tokenized_datasets = DatasetDict(train=tokenized_train, test=tokenized_test)
 
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
         mlm=False,
     )
 
-    training_args_kwargs = dict(
-        output_dir=OUTPUT_DIR,
-        num_train_epochs=NUM_EPOCHS,
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRAD_ACCUM,
-        save_strategy="epoch",
-        logging_strategy="epoch",
-        learning_rate=LR,
-        warmup_ratio=0.03,
-        lr_scheduler_type="cosine",
-        optim="paged_adamw_8bit",
-        fp16=True,
-        bf16=False,
-        save_total_limit=3,
-        report_to="none",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_bert_f1",
-        greater_is_better=True,
-    )
+    best_metric = float("-inf")
+    best_r = None
+    best_output_dir = None
 
-    try:
-        # Новые версии transformers используют evaluation_strategy
-        training_args = TrainingArguments(
-            evaluation_strategy="epoch",
-            **training_args_kwargs,
-        )
-    except TypeError:
-        # Старые версии могут ожидать eval_strategy
-        training_args = TrainingArguments(
-            eval_strategy="epoch",
-            **training_args_kwargs,
+    for r_value in R_VALUES:
+        output_dir_r = os.path.join(OUTPUT_DIR, f"r{r_value}")
+        os.makedirs(output_dir_r, exist_ok=True)
+
+        model = load_qlora_model_fp16(MODEL_NAME, r_value)
+
+        training_args_kwargs = dict(
+            output_dir=output_dir_r,
+            num_train_epochs=NUM_EPOCHS,
+            per_device_train_batch_size=BATCH_SIZE,
+            per_device_eval_batch_size=BATCH_SIZE,
+            gradient_accumulation_steps=GRAD_ACCUM,
+            save_strategy="epoch",
+            logging_strategy="epoch",
+            learning_rate=LR,
+            warmup_ratio=0.03,
+            lr_scheduler_type="cosine",
+            optim="paged_adamw_8bit",
+            fp16=True,
+            bf16=False,
+            save_total_limit=2,
+            report_to="none",
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_bert_f1",
+            greater_is_better=True,
         )
 
-    aim_callback = AimLoggingCallback()
-    generation_metrics = GenerationMetrics(
-        raw_eval_dataset=raw_datasets["test"],
-        tokenizer=tokenizer,
-        system_prompt=SYSTEM_PROMPT,
-        max_eval_samples=None,
-        max_new_tokens=200,
-        batch_size=8,
+        try:
+            training_args = TrainingArguments(
+                evaluation_strategy="epoch",
+                **training_args_kwargs,
+            )
+        except TypeError:
+            training_args = TrainingArguments(
+                eval_strategy="epoch",
+                **training_args_kwargs,
+            )
+
+        aim_callback = AimLoggingCallback(r_value)
+        generation_metrics = GenerationMetrics(
+            raw_eval_dataset=raw_eval_subset,
+            tokenizer=tokenizer,
+            system_prompt=SYSTEM_PROMPT,
+            max_eval_samples=RAW_EVAL_SUBSET_SIZE,
+            max_new_tokens=200,
+            batch_size=8,
+        )
+
+        trainer = CustomTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_datasets["train"],
+            eval_dataset=tokenized_datasets["test"],
+            data_collator=data_collator,
+            callbacks=[aim_callback],
+            generation_metrics=generation_metrics,
+        )
+
+        trainer.train()
+        eval_metrics = trainer.evaluate()
+        current_metric = eval_metrics.get("eval_bert_f1", float("-inf"))
+
+        epoch_logs = [log for log in trainer.state.log_history if "epoch" in log]
+        r_results = []
+        for log in epoch_logs:
+            entry = {"r": r_value, "epoch": log.get("epoch")}
+            for key, value in log.items():
+                if key != "epoch":
+                    entry[key] = value
+            r_results.append(entry)
+            all_results.append(entry)
+
+        if r_results:
+            df_r = pd.DataFrame(r_results)
+            csv_path = os.path.join(output_dir_r, f"metrics_r{r_value}.csv")
+            df_r.to_csv(csv_path, index=False)
+
+            if "eval_bert_f1" in df_r.columns:
+                import matplotlib.pyplot as plt
+
+                plt.figure(figsize=(8, 4))
+                plt.plot(df_r["epoch"], df_r["eval_bert_f1"], marker="o", label="eval_bert_f1")
+                if "eval_loss" in df_r.columns:
+                    plt.plot(df_r["epoch"], df_r["eval_loss"], marker="s", label="eval_loss")
+                plt.xlabel("Эпоха")
+                plt.ylabel("Значение")
+                plt.title(f"Метрики по эпохам для r={r_value}")
+                plt.legend()
+                plt.grid(True, linestyle=":")
+                plot_path = os.path.join(output_dir_r, f"metrics_r{r_value}.png")
+                plt.tight_layout()
+                plt.savefig(plot_path)
+                plt.close()
+
+        if current_metric > best_metric:
+            best_metric = current_metric
+            best_r = r_value
+            best_output_dir = output_dir_r
+            trainer.save_model(best_output_dir)
+            tokenizer.save_pretrained(best_output_dir)
+
+    if all_results:
+        df_all = pd.DataFrame(all_results)
+        df_all.sort_values(["r", "epoch"], inplace=True)
+        df_all.to_csv(os.path.join(OUTPUT_DIR, "hparam_results.csv"), index=False)
+
+    print(
+        f"\nОбучение завершено! Лучшее значение r: {best_r} с метрикой {best_metric:.4f}. "
+        f"Модель сохранена в: {best_output_dir}"
     )
 
-    trainer = CustomTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_datasets["train"],
-        eval_dataset=tokenized_datasets["test"],
-        data_collator=data_collator,
-        callbacks=[aim_callback],
-        generation_metrics=generation_metrics,
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="QLoRA sweep по r со вспомогательными утилитами")
+    parser.add_argument(
+        "--dump-script",
+        dest="dump_script",
+        metavar="PATH",
+        help="Сохранить полный текст скрипта в указанный файл и выйти",
     )
+    parser.add_argument(
+        "--train-subset",
+        type=int,
+        default=TRAIN_SUBSET_SIZE,
+        help="Максимум примеров в train (<=0 — использовать весь датасет)",
+    )
+    parser.add_argument(
+        "--eval-subset",
+        type=int,
+        default=EVAL_SUBSET_SIZE,
+        help="Максимум примеров в eval (<=0 — использовать весь датасет)",
+    )
+    parser.add_argument(
+        "--raw-eval-subset",
+        type=int,
+        default=RAW_EVAL_SUBSET_SIZE,
+        help="Максимум примеров для генерации/метрик (<=0 — использовать весь датасет)",
+    )
+    return parser.parse_args()
 
-    trainer.train()
 
-    trainer.save_model(OUTPUT_DIR)
-    tokenizer.save_pretrained(OUTPUT_DIR)
-
-    print("\nОбучение завершено! Модель сохранена в:", OUTPUT_DIR)
+def dump_current_script(path: str):
+    src = os.path.abspath(__file__)
+    shutil.copyfile(src, path)
+    print(f"Скрипт сохранён в {path}")
 
 
 if __name__ == "__main__":
-    main()
+    cli_args = parse_args()
+    if cli_args.dump_script:
+        dump_current_script(cli_args.dump_script)
+    else:
+        main(cli_args)
