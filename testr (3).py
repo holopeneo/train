@@ -1,3 +1,7 @@
+from transformers import set_seed
+
+set_seed(42)
+
 import argparse
 import os
 import shutil
